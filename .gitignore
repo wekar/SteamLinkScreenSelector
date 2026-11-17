@@ -1,0 +1,6 @@
+# Build output is intentionally committed (SteamLinkScreenSelector.exe) so users
+# can download a ready-to-run release. Ignore only transient build artifacts.
+*.pdb
+*.obj
+*.suo
+*.user
