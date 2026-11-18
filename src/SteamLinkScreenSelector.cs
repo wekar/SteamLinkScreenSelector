@@ -2,9 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
+
+[assembly: AssemblyTitle("Steam Link Screen Selector")]
+[assembly: AssemblyProduct("Steam Link Screen Selector")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
 
 class App
 {
@@ -18,6 +24,7 @@ class App
  [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr h,IntPtr a,byte[] b,UIntPtr s,out UIntPtr w);
  [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h,IntPtr a,byte[] b,UIntPtr s,out UIntPtr r);
  [DllImport("kernel32.dll")] static extern bool FlushInstructionCache(IntPtr h,IntPtr a,UIntPtr s);
+ [DllImport("kernel32.dll")] static extern bool IsWow64Process(IntPtr h,out bool w);
 
  [StructLayout(LayoutKind.Sequential)] struct LUID{public uint Lo;public int Hi;}
  [StructLayout(LayoutKind.Sequential)] struct SRC{public LUID ad;public uint id;public uint mi;}
@@ -56,25 +63,30 @@ class App
 
  static void Add(List<byte> l,params byte[] b){ l.AddRange(b); }
 
- static bool Install(int[] r){
+ static string Install(int[] r){
   var ps=Process.GetProcessesByName("steam");
-  if(ps.Length==0)return false;
+  if(ps.Length==0)return "Steam is not running (no 'steam' process). Start Steam first.";
   targetPid=ps[0].Id;
   hProc=OpenProcess(PROC,false,targetPid);
-  if(hProc==IntPtr.Zero)return false;
+  if(hProc==IntPtr.Zero){ int e=Marshal.GetLastWin32Error(); return "Cannot open Steam process (OpenProcess err "+e+"). "+(e==5?"Access denied - run this app as the SAME user as Steam, or as admin if Steam is elevated.":"Try running as admin."); }
+  bool wow=false; try{ IsWow64Process(hProc,out wow); }catch{}
+  if(wow){ CloseHandle(hProc); hProc=IntPtr.Zero; return "This Steam is 32-bit (WOW64). This tool only hooks the 64-bit Steam client. Update Steam to the current (64-bit) client."; }
   gcp=GetProcAddress(GetModuleHandle("user32.dll"),"GetCursorPos");
-  var pre=new byte[16]; UIntPtr u;
-  if(!ReadProcessMemory(hProc,gcp,pre,(UIntPtr)16,out u)||pre[9]!=0x48||pre[10]!=0xFF||pre[11]!=0x25){ CloseHandle(hProc); hProc=IntPtr.Zero; return false; }
-  int disp=BitConverter.ToInt32(pre,12);
-  IntPtr wptr=(IntPtr)(gcp.ToInt64()+16+disp);
+  var pre=new byte[24]; UIntPtr u;
+  if(!ReadProcessMemory(hProc,gcp,pre,(UIntPtr)24,out u)){ int e=Marshal.GetLastWin32Error(); CloseHandle(hProc); hProc=IntPtr.Zero; return "ReadProcessMemory failed (err "+e+") at GetCursorPos. Likely a bitness/ASLR mismatch."; }
+  int j=-1; for(int i=0;i<=16;i++){ if(pre[i]==0x48&&pre[i+1]==0xFF&&pre[i+2]==0x25){ j=i; break; } }
+  if(j<0){ string hex=BitConverter.ToString(pre); CloseHandle(hProc); hProc=IntPtr.Zero; return "GetCursorPos prologue not recognized on this Windows build. Bytes: "+hex; }
+  byte[] setup=new byte[j]; Array.Copy(pre,0,setup,0,j);
+  int disp=BitConverter.ToInt32(pre,j+3);
+  IntPtr wptr=(IntPtr)(gcp.ToInt64()+j+7+disp);
   var wb=new byte[8]; ReadProcessMemory(hProc,wptr,wb,(UIntPtr)8,out u);
   long worker=BitConverter.ToInt64(wb,0);
   cave=VirtualAllocEx(hProc,IntPtr.Zero,(UIntPtr)256,MEM,RWX);
-  if(cave==IntPtr.Zero){ CloseHandle(hProc); hProc=IntPtr.Zero; return false; }
+  if(cave==IntPtr.Zero){ int e=Marshal.GetLastWin32Error(); CloseHandle(hProc); hProc=IntPtr.Zero; return "VirtualAllocEx failed (err "+e+") - cannot allocate code cave in Steam."; }
   WriteRect(r);
   long ds=cave.ToInt64();
   var c=new List<byte>();
-  Add(c,0x48,0x83,0xEC,0x28); Add(c,0x48,0x89,0x4C,0x24,0x20); Add(c,0xBA,0x01,0x00,0x00,0x00); Add(c,0x44,0x8D,0x42,0x7E);
+  Add(c,0x48,0x83,0xEC,0x28); Add(c,0x48,0x89,0x4C,0x24,0x20); c.AddRange(setup);
   c.Add(0x48); c.Add(0xB8); c.AddRange(BitConverter.GetBytes(worker)); Add(c,0xFF,0xD0);
   Add(c,0x48,0x8B,0x4C,0x24,0x20); c.Add(0x48); c.Add(0xB8); c.AddRange(BitConverter.GetBytes(ds));
   Add(c,0x8B,0x11,0x44,0x8B,0x00,0x44,0x39,0xC2,0x41,0x0F,0x4C,0xD0,0x44,0x8B,0x48,0x08,0x41,0x83,0xE9,0x01,0x44,0x39,0xCA,0x41,0x0F,0x4F,0xD1,0x89,0x11);
@@ -90,7 +102,7 @@ class App
   VirtualProtectEx(hProc,gcp,(UIntPtr)16,old,out old);
   FlushInstructionCache(hProc,gcp,(UIntPtr)16);
   hooked=true; curRect=r;
-  return true;
+  return null;
  }
 
  static void WriteRect(int[] r){ var b=new byte[16]; BitConverter.GetBytes(r[0]).CopyTo(b,0); BitConverter.GetBytes(r[1]).CopyTo(b,4); BitConverter.GetBytes(r[2]).CopyTo(b,8); BitConverter.GetBytes(r[3]).CopyTo(b,12); UIntPtr u; WriteProcessMemory(hProc,cave,b,(UIntPtr)16,out u); }
@@ -108,7 +120,7 @@ class App
  static void SetMon(int[] r){
   if(hooked && !Alive()){ hProc=IntPtr.Zero; cave=IntPtr.Zero; hooked=false; curRect=null; }
   if(r==null){ Uninstall(); return; }
-  if(!hooked){ if(!Install(r)){ Ni.ShowBalloonTip(3000,"Steam Link Screen Selector","Steam not running or access denied.",ToolTipIcon.Warning); } }
+  if(!hooked){ string err=Install(r); if(err!=null){ Ni.ShowBalloonTip(6000,"Steam Link Screen Selector",err,ToolTipIcon.Warning); } }
   else { WriteRect(r); curRect=r; }
  }
 
